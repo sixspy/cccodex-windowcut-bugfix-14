@@ -6,7 +6,7 @@ from datetime import datetime
 from fastapi import APIRouter, HTTPException
 
 from auth import AuthHeader, require_user
-from db import connect, write_audit
+from db import LATE_REASON, connect, insert_event, insert_late_pair, write_audit
 from locks import release, require_lock
 from models import EventIn
 
@@ -32,24 +32,16 @@ def ingest_event(body: EventIn, authorization: AuthHeader = None):
             ts = body.event_ts
             created = _now()
             if w["status"] == "已关闭":
-                cur = conn.execute(
-                    """INSERT INTO events(window_id,biz_key,event_ts,amount,disposition,created_at)
-                       VALUES (?,?,?,?,?,?)""",
-                    (None, body.biz_key, ts, body.amount, "迟到桶", created),
-                )
-                eid = cur.lastrowid
-                conn.execute(
-                    """INSERT INTO late_bucket(event_id,window_name,biz_key,event_ts,amount,reason,created_at)
-                       VALUES (?,?,?,?,?,?,?)""",
-                    (
-                        eid,
-                        body.window_name,
-                        body.biz_key,
-                        ts,
-                        body.amount,
-                        "关窗后到达",
-                        created,
-                    ),
+                # 与种子装载同源（db.insert_late_pair，甲路径同事务双写）：
+                # events + late_bucket 同一事务，桶失败则事件一并回滚。
+                eid = insert_late_pair(
+                    conn,
+                    window_name=body.window_name,
+                    biz_key=body.biz_key,
+                    event_ts=ts,
+                    amount=body.amount,
+                    created_at=created,
+                    reason=LATE_REASON,
                 )
                 write_audit(
                     conn,
@@ -62,10 +54,14 @@ def ingest_event(body: EventIn, authorization: AuthHeader = None):
                 return {"disposition": "迟到桶", "event_id": eid}
 
             if not (w["open_at"] <= ts <= w["close_at"]):
-                conn.execute(
-                    """INSERT INTO events(window_id,biz_key,event_ts,amount,disposition,created_at)
-                       VALUES (?,?,?,?,?,?)""",
-                    (None, body.biz_key, ts, body.amount, "拒收", created),
+                insert_event(
+                    conn,
+                    window_id=None,
+                    biz_key=body.biz_key,
+                    event_ts=ts,
+                    amount=body.amount,
+                    disposition="拒收",
+                    created_at=created,
                 )
                 conn.execute(
                     """INSERT INTO reject_slips(window_name,biz_key,event_ts,amount,reason,created_at)
@@ -89,10 +85,14 @@ def ingest_event(body: EventIn, authorization: AuthHeader = None):
                 conn.commit()
                 raise HTTPException(409, "事件时间落在窗外且窗仍开启：拒收")
 
-            cur = conn.execute(
-                """INSERT INTO events(window_id,biz_key,event_ts,amount,disposition,created_at)
-                   VALUES (?,?,?,?,?,?)""",
-                (w["id"], body.biz_key, ts, body.amount, "窗内", created),
+            eid = insert_event(
+                conn,
+                window_id=w["id"],
+                biz_key=body.biz_key,
+                event_ts=ts,
+                amount=body.amount,
+                disposition="窗内",
+                created_at=created,
             )
             write_audit(
                 conn,
@@ -102,7 +102,7 @@ def ingest_event(body: EventIn, authorization: AuthHeader = None):
                 {"window_id": w["id"]},
             )
             conn.commit()
-            return {"disposition": "窗内", "window_id": w["id"], "event_id": cur.lastrowid}
+            return {"disposition": "窗内", "window_id": w["id"], "event_id": eid}
         finally:
             release(conn, lock_key, user)
             conn.commit()

@@ -20,7 +20,7 @@ class LockIn(BaseModel):
 def try_acquire(conn, lock_key: str, holder: str) -> bool:
     now = datetime.now().isoformat(timespec="seconds")
     row = conn.execute(
-        "SELECT holder FROM window_locks WHERE lock_key=?", (lock_key,)
+        "SELECT holder AS current_holder FROM window_locks WHERE lock_key=?", (lock_key,)
     ).fetchone()
     if row is None:
         conn.execute(
@@ -28,12 +28,13 @@ def try_acquire(conn, lock_key: str, holder: str) -> bool:
             (lock_key, holder, now),
         )
         return True
-    if row["holder"] == holder:
+    # 注意：别名 current_holder，避免与参数 holder 同名遮蔽导致恒真重入
+    if row["current_holder"] == holder:
         return True
     conn.execute(
         """INSERT INTO contention_log(lock_key,actor,action,detail,created_at)
            VALUES (?,?,?,?,?)""",
-        (lock_key, holder, "争用", f"持有者={row['holder']}", now),
+        (lock_key, holder, "争用", f"持有者={row['current_holder']}", now),
     )
     return False
 

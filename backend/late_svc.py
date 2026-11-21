@@ -7,7 +7,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from auth import AuthHeader, require_user
-from db import connect, write_audit
+from db import connect, reseed_database, write_audit
 from locks import release, require_lock
 
 router = APIRouter(tags=["late"])
@@ -16,6 +16,17 @@ router = APIRouter(tags=["late"])
 class LatePromoteIn(BaseModel):
     late_id: int
     target_window_name: str
+
+
+@router.post("/api/admin/reseed")
+def admin_reseed(authorization: AuthHeader = None):
+    """重种子（甲路径，见 docs/seed-homology-registry.md）。
+
+    占种子锁 seed:reseed 后清业务表同源重灌；两人同时触发时后到者
+    在 reseed_database 内被拒（409 + contention_log + 审计），业务零增。
+    """
+    user = require_user(authorization)
+    return reseed_database(user)
 
 
 @router.get("/api/late-bucket")
